@@ -1,0 +1,201 @@
+name: Build YT-DLP Studio
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  APP_NAME: ytdlp-studio
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  # ------------------------------------------------------------------
+  # Native executables via PyInstaller (Windows / macOS / Ubuntu matrix)
+  # ------------------------------------------------------------------
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: ultra/requirements.txt
+
+      # System deps: Qt runtime libs + ffmpeg (merging/muxing) per OS.
+      - name: Install Linux system deps (Fedora/Debian/Ubuntu compat)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libxcb-cursor0 libxcb-xinerama0 \
+            libgl1 libegl1 libxkbcommon-x11-0 libdbus-1-3 \
+            fuse libfuse2 file desktop-file-utils
+
+      - name: Install macOS deps
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg create-dmg || true
+
+      - name: Install Windows deps
+        if: runner.os == 'Windows'
+        run: |
+          winget install --id Gyan.FFmpeg -e --accept-source-agreements --accept-package-agreements || echo "ffmpeg install skipped"
+
+      - name: Install Python deps
+        working-directory: ultra
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller>=6.0
+
+      - name: Smoke test (imports + option mapping)
+        working-directory: ultra
+        run: |
+          python -c "import PySide6, yt_dlp; print('PySide6', PySide6.__version__); print('yt-dlp ok')"
+          python -c "from src.options import default_settings, build_ydl_opts; o=build_ydl_opts(default_settings()); print('ydl_opts keys:', len(o))"
+
+      - name: Build with PyInstaller
+        working-directory: ultra
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --windowed \
+            --name "${{ env.APP_NAME }}" \
+            --collect-all yt_dlp \
+            --hidden-import yt_dlp \
+            main.py
+
+      - name: List dist
+        working-directory: ultra
+        shell: bash
+        run: ls -la dist/
+
+      # ---- macOS .app polish: PyInstaller --windowed already emits .app? ----
+      # (onefile+windowed yields a bare binary on mac; wrap note in release.)
+
+      - name: Upload executable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-${{ runner.os }}-${{ runner.arch }}
+          path: ultra/dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  # ------------------------------------------------------------------
+  # Universal Linux AppImage (ideal for Fedora & Debian) — built from
+  # the PyInstaller binary so GUI deps travel with the app.
+  # ------------------------------------------------------------------
+  appimage:
+    name: AppImage (Ubuntu/Fedora/Debian universal)
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg file desktop-file-utils \
+            libxcb-cursor0 libgl1 libegl1 libxkbcommon-x11-0 libdbus-1-3 \
+            fuse libfuse2 wget
+          python -m pip install --upgrade pip
+          pip install -r ultra/requirements.txt
+          pip install pyinstaller>=6.0
+          # appimagetool (universal Linux bundler)
+          wget -q -O /tmp/appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x /tmp/appimagetool
+
+      - name: Build onefile binary for AppImage payload
+        working-directory: ultra
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --windowed \
+            --name "${{ env.APP_NAME }}" \
+            --collect-all yt_dlp \
+            --hidden-import yt_dlp \
+            main.py
+          ls -la dist/
+
+      - name: Assemble AppDir
+        run: |
+          APPDIR="$GITHUB_WORKSPACE/${{ env.APP_NAME }}.AppDir"
+          rm -rf "$APPDIR"
+          mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons/hicolor/256x256/apps"
+          cp "ultra/dist/${{ env.APP_NAME }}" "$APPDIR/usr/bin/${{ env.APP_NAME }}"
+          chmod +x "$APPDIR/usr/bin/${{ env.APP_NAME }}"
+          # Minimal SVG icon (no binary asset needed)
+          cat > "$APPDIR/usr/share/icons/hicolor/256x256/apps/${{ env.APP_NAME }}.svg" <<'EOF'
+          <svg xmlns="http://www.w3.org/2000/svg" width="256" height="256"><rect width="256" height="256" rx="56" fill="#181a1b"/><circle cx="128" cy="128" r="64" fill="#3b82f6"/><polygon points="118,98 158,128 118,158" fill="#fff"/></svg>
+          EOF
+          cp "$APPDIR/usr/share/icons/hicolor/256x256/apps/${{ env.APP_NAME }}.svg" "$APPDIR/${{ env.APP_NAME }}.svg"
+          cat > "$APPDIR/usr/share/applications/${{ env.APP_NAME }}.desktop" <<EOF
+          [Desktop Entry]
+          Type=Application
+          Name=YT-DLP Studio
+          Comment=Fast yt-dlp desktop client (PySide6)
+          Exec=${{ env.APP_NAME }}
+          Icon=${{ env.APP_NAME }}
+          Categories=AudioVideo;Video;Network;
+          Terminal=false
+          EOF
+          cp "$APPDIR/usr/share/applications/${{ env.APP_NAME }}.desktop" "$APPDIR/"
+          cat > "$APPDIR/AppRun" <<EOF
+          #!/bin/sh
+          SELF=\$(readlink -f "\$0")
+          HERE=\${SELF%/*}
+          exec "\$HERE/usr/bin/${{ env.APP_NAME }}" "\$@"
+          EOF
+          chmod +x "$APPDIR/AppRun"
+
+      - name: Build AppImage
+        run: |
+          APPDIR="$GITHUB_WORKSPACE/${{ env.APP_NAME }}.AppDir"
+          /tmp/appimagetool --appimage-extract-and-run "$APPDIR" \
+            "$GITHUB_WORKSPACE/${{ env.APP_NAME }}-x86_64.AppImage" || \
+          /tmp/appimagetool "$APPDIR" "$GITHUB_WORKSPACE/${{ env.APP_NAME }}-x86_64.AppImage"
+          ls -la "$GITHUB_WORKSPACE"/*.AppImage
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-AppImage-x86_64
+          path: ${{ env.APP_NAME }}-x86_64.AppImage
+          if-no-files-found: error
+          retention-days: 30
+
+  # ------------------------------------------------------------------
+  # GitHub Release on tags (attaches all artifacts)
+  # ------------------------------------------------------------------
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, appimage]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
