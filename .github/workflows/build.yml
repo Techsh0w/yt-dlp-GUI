@@ -9,6 +9,9 @@ env:
   APP_NAME: ytdlp-studio
 
 jobs:
+  # ---------------------------------------------------------
+  # Normal executables for Windows / macOS / Ubuntu
+  # ---------------------------------------------------------
   build:
     name: Build ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
@@ -33,6 +36,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg libxcb-cursor0 libxcb-xinerama0 \
             libgl1 libegl1 libxkbcommon-x11-0 libdbus-1-3 fuse libfuse2 file
+
+      - name: Install ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          winget install --id Gyan.FFmpeg -e --accept-source-agreements --accept-package-agreements || echo "ffmpeg install skipped"
 
       - name: Install Python deps
         run: |
@@ -60,4 +68,83 @@ jobs:
         with:
           name: ${{ env.APP_NAME }}-${{ runner.os }}
           path: dist/*
+          retention-days: 30
+
+  # ---------------------------------------------------------
+  # AppImage — runs on Fedora, Debian, Ubuntu, etc.
+  # ---------------------------------------------------------
+  appimage:
+    name: AppImage (Fedora / Debian / Ubuntu)
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg file desktop-file-utils \
+            libxcb-cursor0 libgl1 libegl1 libxkbcommon-x11-0 libdbus-1-3 \
+            fuse libfuse2 wget
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller>=6.0
+          wget -q -O /tmp/appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x /tmp/appimagetool
+
+      - name: Build binary for AppImage
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --windowed \
+            --name "${APP_NAME}" \
+            --collect-all yt_dlp \
+            --hidden-import yt_dlp \
+            main.py
+
+      - name: Assemble AppDir
+        run: |
+          APPDIR="$GITHUB_WORKSPACE/${APP_NAME}.AppDir"
+          rm -rf "$APPDIR"
+          mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons/hicolor/256x256/apps"
+          cp "dist/${APP_NAME}" "$APPDIR/usr/bin/${APP_NAME}"
+          chmod +x "$APPDIR/usr/bin/${APP_NAME}"
+          cat > "$APPDIR/usr/share/icons/hicolor/256x256/apps/${APP_NAME}.svg" <<'EOF'
+          <svg xmlns="http://www.w3.org/2000/svg" width="256" height="256"><rect width="256" height="256" rx="56" fill="#181a1b"/><circle cx="128" cy="128" r="64" fill="#3b82f6"/><polygon points="118,98 158,128 118,158" fill="#fff"/></svg>
+          EOF
+          cp "$APPDIR/usr/share/icons/hicolor/256x256/apps/${APP_NAME}.svg" "$APPDIR/${APP_NAME}.svg"
+          cat > "$APPDIR/usr/share/applications/${APP_NAME}.desktop" <<EOF
+          [Desktop Entry]
+          Type=Application
+          Name=YT-DLP Studio
+          Comment=Fast yt-dlp desktop client
+          Exec=${APP_NAME}
+          Icon=${APP_NAME}
+          Categories=AudioVideo;Video;Network;
+          Terminal=false
+          EOF
+          cp "$APPDIR/usr/share/applications/${APP_NAME}.desktop" "$APPDIR/"
+          cat > "$APPDIR/AppRun" <<EOF
+          #!/bin/sh
+          SELF=\$(readlink -f "\$0")
+          HERE=\${SELF%/*}
+          exec "\$HERE/usr/bin/${APP_NAME}" "\$@"
+          EOF
+          chmod +x "$APPDIR/AppRun"
+
+      - name: Build AppImage
+        run: |
+          APPDIR="$GITHUB_WORKSPACE/${APP_NAME}.AppDir"
+          /tmp/appimagetool "$APPDIR" "$GITHUB_WORKSPACE/${APP_NAME}-x86_64.AppImage" || true
+          ls -la "$GITHUB_WORKSPACE"/*.AppImage
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-AppImage-x86_64
+          path: ${{ env.APP_NAME }}-x86_64.AppImage
+          if-no-files-found: error
           retention-days: 30
