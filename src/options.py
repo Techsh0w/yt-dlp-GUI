@@ -235,8 +235,8 @@ def build_ydl_opts(settings: Dict[str, Any], *, for_probe: bool = False) -> Dict
     # -- embedding -------------------------------------------------------------------
     pp = list(ydl.get("postprocessors", []))
     if s.get("embed_metadata") and not for_probe:
-        pp.append({"key": "FFmpegMetadata", "add_chapters": bool(s.get("embed_chapters")),
-                   "add_infojson": "if_exists", "add_metadata_from_title": "%(title)s"})
+    pp.append({"key": "FFmpegMetadata", "add_chapters": bool(s.get("embed_chapters")),
+               "add_infojson": "if_exists"})
     if s.get("embed_thumbnail") and not for_probe:
         pp.append({"key": "EmbedThumbnail", "already_have_thumbnail": False})
     if s.get("extract_audio") and not for_probe:
